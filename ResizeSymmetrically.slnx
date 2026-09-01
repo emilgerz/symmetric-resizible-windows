@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="ResizeSymmetrically.vcxproj" />
+  <Project Path="GeometryTests.vcxproj" />
+  <Project Path="TestWindow.vcxproj" />
+</Solution>
