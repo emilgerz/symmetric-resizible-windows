@@ -321,6 +321,12 @@ LRESULT App::OnCoordinatorMessage(HWND window, UINT message, WPARAM wParam, LPAR
     case kMessageApplyResize:
         resizeEngine_.ApplyPendingResize();
         return 0;
+    case WM_TIMER:
+        if (wParam == kResizeTimerId) {
+            resizeEngine_.ApplyPendingResize();
+            return 0;
+        }
+        break;
     case kMessageShowSettings:
         ShowSettings();
         return 0;
@@ -342,6 +348,7 @@ LRESULT App::OnCoordinatorMessage(HWND window, UINT message, WPARAM wParam, LPAR
     default:
         return DefWindowProcW(window, message, wParam, lParam);
     }
+    return DefWindowProcW(window, message, wParam, lParam);
 }
 
 LRESULT App::OnSettingsMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {

@@ -45,13 +45,25 @@ int main() {
         CalculateSymmetricRect(initial, cursor, {400, 250}, ResizeEdge::Left,
             Constraints(screen, {200, 100})),
         {200, 100, 400, 400});
-    ExpectRect("screen edge clamp",
+    ExpectRect("continue along free side after left screen edge",
         CalculateSymmetricRect(initial, cursor, {-500, 250}, ResizeEdge::Left, Constraints(screen)),
-        {0, 100, 600, 400});
+        {0, 100, 1100, 400});
+    ExpectRect("continue along free side after right screen edge",
+        CalculateSymmetricRect({1400, 100, 1800, 400}, {1400, 250}, {800, 250},
+            ResizeEdge::Left, Constraints(screen)),
+        {800, 100, 1920, 400});
+    ExpectRect("free-side growth respects maximum tracking size",
+        CalculateSymmetricRect(initial, {500, 250}, {1400, 250}, ResizeEdge::Right,
+            Constraints(screen, {1, 1}, {1000, 1000})),
+        {0, 100, 1000, 400});
+    ExpectRect("both screen edges clamp",
+        CalculateSymmetricRect(initial, {500, 250}, {2500, 250}, ResizeEdge::Right,
+            Constraints(screen)),
+        {0, 100, 1920, 400});
     ExpectRect("negative monitor coordinates",
         CalculateSymmetricRect({-1800, 100, -1400, 400}, {-1800, 250}, {-2000, 250}, ResizeEdge::Left,
             Constraints({-1920, 0, 0, 1080})),
-        {-1920, 100, -1280, 400});
+        {-1920, 100, -1200, 400});
     ExpectRect("odd center preserved",
         CalculateSymmetricRect({101, 100, 500, 400}, {101, 250}, {100, 250}, ResizeEdge::Left,
             Constraints(screen)),

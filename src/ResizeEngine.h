@@ -10,6 +10,7 @@
 namespace resize_symmetrically {
 
 constexpr UINT kMessageApplyResize = WM_APP + 40;
+constexpr UINT_PTR kResizeTimerId = 0x5253;
 
 class ResizeEngine {
 public:
@@ -61,14 +62,16 @@ private:
     std::atomic<ModifierKey> modifier_{ModifierKey::Alt};
     std::atomic<unsigned> modifierState_{0};
     std::atomic<bool> gestureActive_{false};
-    std::atomic<bool> suppressNextModifierRelease_{false};
+    std::atomic<bool> cancelMenuOnModifierRelease_{false};
     std::atomic<HWND> lastTarget_{nullptr};
     Session session_{};
 
     CRITICAL_SECTION pendingLock_{};
     RECT pendingRect_{};
     HWND pendingTarget_ = nullptr;
-    bool pendingMessagePosted_ = false;
+    bool pendingDirty_ = false;
+    bool pendingUpdateScheduled_ = false;
+    ULONGLONG nextApplyTick_ = 0;
 };
 
 }  // namespace resize_symmetrically

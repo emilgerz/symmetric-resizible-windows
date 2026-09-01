@@ -12,6 +12,7 @@ namespace {
 
 ResizeEngine* g_engine = nullptr;
 constexpr DWORD kWindowMessageTimeoutMs = 40;
+constexpr ULONGLONG kResizeFrameIntervalMs = 16;
 
 DWORD ProcessIntegrityLevel(DWORD processId) {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
@@ -118,13 +119,16 @@ void ResizeEngine::Stop() {
     thread_ = nullptr;
     threadId_ = 0;
     gestureActive_.store(false);
+    if (coordinatorWindow_) {
+        KillTimer(coordinatorWindow_, kResizeTimerId);
+    }
     g_engine = nullptr;
 }
 
 void ResizeEngine::SetModifier(ModifierKey modifier) {
     modifier_.store(modifier);
     modifierState_.store(0);
-    suppressNextModifierRelease_.store(false);
+    cancelMenuOnModifierRelease_.store(false);
 
     auto physical = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     unsigned state = 0;
@@ -207,7 +211,8 @@ LRESULT CALLBACK ResizeEngine::KeyboardHookProc(int code, WPARAM wParam, LPARAM 
 
 LRESULT ResizeEngine::HandleMouse(WPARAM message, const MSLLHOOKSTRUCT& data) {
     if (message == WM_LBUTTONDOWN && !session_.active) {
-        if (IsModifierDown() && BeginSession(data.pt)) {
+        const bool modifierDown = IsModifierDown();
+        if (modifierDown && BeginSession(data.pt)) {
             return 1;
         }
         return 0;
@@ -225,7 +230,7 @@ LRESULT ResizeEngine::HandleMouse(WPARAM message, const MSLLHOOKSTRUCT& data) {
                 session_.initialRect = session_.currentRect;
                 session_.initialCursor = data.pt;
                 session_.suspended = false;
-                return 1;
+                return 0;
             }
             const RECT rect = CalculateSymmetricRect(
                 session_.initialRect,
@@ -238,7 +243,10 @@ LRESULT ResizeEngine::HandleMouse(WPARAM message, const MSLLHOOKSTRUCT& data) {
         } else {
             session_.suspended = true;
         }
-        return 1;
+        // A non-zero result from WH_MOUSE_LL suppresses the physical cursor
+        // movement itself. The button-down was already consumed, so passing
+        // moves through cannot start the window's native sizing loop.
+        return 0;
     }
     if (message == WM_LBUTTONUP) {
         EndSession();
@@ -248,7 +256,7 @@ LRESULT ResizeEngine::HandleMouse(WPARAM message, const MSLLHOOKSTRUCT& data) {
 }
 
 LRESULT ResizeEngine::HandleKeyboard(WPARAM message, const KBDLLHOOKSTRUCT& data) {
-    if ((data.flags & LLKHF_INJECTED) != 0 || !MatchesSelectedModifier(data.vkCode)) {
+    if (!MatchesSelectedModifier(data.vkCode)) {
         return 0;
     }
 
@@ -265,16 +273,20 @@ LRESULT ResizeEngine::HandleKeyboard(WPARAM message, const KBDLLHOOKSTRUCT& data
         session_.suspended = true;
     }
     const ModifierKey modifier = modifier_.load();
-    const bool needsSuppression = modifier == ModifierKey::Alt || modifier == ModifierKey::Win;
-    if (needsSuppression && (gestureActive_.load() || suppressNextModifierRelease_.exchange(false))) {
+    const bool needsMenuCancel = modifier == ModifierKey::Alt || modifier == ModifierKey::Win;
+    if (needsMenuCancel &&
+        (gestureActive_.load() || cancelMenuOnModifierRelease_.exchange(false))) {
         const HWND target = lastTarget_.load();
         if (target && IsWindow(target)) {
-            const UINT keyMessage = modifier == ModifierKey::Alt ? WM_SYSKEYUP : WM_KEYUP;
-            const LPARAM keyFlags = modifier == ModifierKey::Alt ? 0xE0000001 : 0xC0000001;
-            PostMessageW(target, keyMessage, data.vkCode, keyFlags);
             PostMessageW(target, WM_CANCELMODE, 0, 0);
         }
-        return 1;
+        const HWND foreground = GetForegroundWindow();
+        if (foreground && foreground != target) {
+            PostMessageW(foreground, WM_CANCELMODE, 0, 0);
+        }
+        // Never swallow the real key-up. A posted WM_KEYUP/WM_SYSKEYUP does
+        // not update Windows' global keyboard state and leaves Alt/Win stuck.
+        return 0;
     }
     return 0;
 }
@@ -331,6 +343,13 @@ bool ResizeEngine::BeginSession(POINT cursor) {
     session_.constraints.screenBounds = monitorBounds;
     lastTarget_.store(target);
     gestureActive_.store(true);
+    const ModifierKey modifier = modifier_.load();
+    if (modifier == ModifierKey::Alt || modifier == ModifierKey::Win) {
+        const HWND foreground = GetForegroundWindow();
+        if (foreground) {
+            PostMessageW(foreground, WM_CANCELMODE, 0, 0);
+        }
+    }
     return true;
 }
 
@@ -343,12 +362,26 @@ void ResizeEngine::EndSession() {
     gestureActive_.store(false);
     const ModifierKey modifier = modifier_.load();
     if (IsModifierDown() && (modifier == ModifierKey::Alt || modifier == ModifierKey::Win)) {
-        suppressNextModifierRelease_.store(true);
+        cancelMenuOnModifierRelease_.store(true);
     }
 }
 
 bool ResizeEngine::IsModifierDown() const {
-    return modifierState_.load() != 0;
+    if (modifierState_.load() != 0) {
+        return true;
+    }
+    // This also covers an already-held modifier when the hook starts and
+    // input produced by accessibility/automation tools.
+    int virtualKey = VK_MENU;
+    switch (modifier_.load()) {
+    case ModifierKey::Alt: virtualKey = VK_MENU; break;
+    case ModifierKey::Ctrl: virtualKey = VK_CONTROL; break;
+    case ModifierKey::Shift: virtualKey = VK_SHIFT; break;
+    case ModifierKey::Win:
+        return (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+            (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+    }
+    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
 }
 
 bool ResizeEngine::MatchesSelectedModifier(DWORD vkCode) const {
@@ -382,8 +415,9 @@ void ResizeEngine::QueueResize(const RECT& rect, HWND target) {
     EnterCriticalSection(&pendingLock_);
     pendingRect_ = rect;
     pendingTarget_ = target;
-    if (!pendingMessagePosted_) {
-        pendingMessagePosted_ = true;
+    pendingDirty_ = true;
+    if (!pendingUpdateScheduled_) {
+        pendingUpdateScheduled_ = true;
         post = true;
     }
     LeaveCriticalSection(&pendingLock_);
@@ -395,18 +429,51 @@ void ResizeEngine::QueueResize(const RECT& rect, HWND target) {
 void ResizeEngine::ApplyPendingResize() {
     RECT rect{};
     HWND target = nullptr;
-    EnterCriticalSection(&pendingLock_);
-    rect = pendingRect_;
-    target = pendingTarget_;
-    pendingMessagePosted_ = false;
-    LeaveCriticalSection(&pendingLock_);
+    UINT delay = 0;
+    bool apply = false;
+    const ULONGLONG now = GetTickCount64();
 
-    if (!target || !IsWindow(target)) {
+    EnterCriticalSection(&pendingLock_);
+    if (!pendingUpdateScheduled_) {
+        LeaveCriticalSection(&pendingLock_);
         return;
     }
-    SetWindowPos(target, nullptr, rect.left, rect.top,
-        rect.right - rect.left, rect.bottom - rect.top,
-        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+    if (now < nextApplyTick_) {
+        delay = static_cast<UINT>(std::max<ULONGLONG>(1, nextApplyTick_ - now));
+    } else if (pendingDirty_) {
+        rect = pendingRect_;
+        target = pendingTarget_;
+        pendingDirty_ = false;
+        apply = true;
+    } else {
+        pendingUpdateScheduled_ = false;
+    }
+    LeaveCriticalSection(&pendingLock_);
+
+    if (delay != 0) {
+        SetTimer(coordinatorWindow_, kResizeTimerId, delay, nullptr);
+        return;
+    }
+    KillTimer(coordinatorWindow_, kResizeTimerId);
+    if (apply && target && IsWindow(target)) {
+        SetWindowPos(target, nullptr, rect.left, rect.top,
+            rect.right - rect.left, rect.bottom - rect.top,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS);
+    }
+
+    bool scheduleNext = false;
+    EnterCriticalSection(&pendingLock_);
+    nextApplyTick_ = GetTickCount64() + kResizeFrameIntervalMs;
+    if (pendingDirty_) {
+        scheduleNext = true;
+    } else {
+        pendingUpdateScheduled_ = false;
+    }
+    LeaveCriticalSection(&pendingLock_);
+    if (scheduleNext) {
+        SetTimer(coordinatorWindow_, kResizeTimerId,
+            static_cast<UINT>(kResizeFrameIntervalMs), nullptr);
+    }
 }
 
 bool ResizeEngine::IsSupportedTarget(HWND window, RECT& rect, RECT& monitorBounds) const {

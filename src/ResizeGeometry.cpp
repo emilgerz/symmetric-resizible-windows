@@ -7,6 +7,11 @@
 namespace resize_symmetrically {
 namespace {
 
+struct AxisRange {
+    long lower;
+    long upper;
+};
+
 long ClampDimension(long desired, long minimum, long maximum, long centerSum) noexcept {
     minimum = std::max(1L, minimum);
     maximum = std::max(minimum, maximum);
@@ -24,11 +29,104 @@ long ClampDimension(long desired, long minimum, long maximum, long centerSum) no
     return desired;
 }
 
-long SafeTwiceDistance(long centerSum, long boundary, bool lowerBoundary) noexcept {
-    const std::int64_t value = lowerBoundary
-        ? static_cast<std::int64_t>(centerSum) - 2LL * boundary
-        : 2LL * boundary - static_cast<std::int64_t>(centerSum);
-    return static_cast<long>(std::clamp<std::int64_t>(value, 1, LONG_MAX));
+AxisRange ShiftIntoBounds(
+    AxisRange range, long lowerBound, long upperBound) noexcept {
+    if (range.lower < lowerBound) {
+        const long shift = lowerBound - range.lower;
+        range.lower += shift;
+        range.upper += shift;
+    }
+    if (range.upper > upperBound) {
+        const long shift = range.upper - upperBound;
+        range.lower -= shift;
+        range.upper -= shift;
+    }
+    return range;
+}
+
+AxisRange CenteredRange(
+    long centerSum,
+    long size,
+    long minimum,
+    long maximum,
+    long lowerBound,
+    long upperBound) noexcept {
+    size = ClampDimension(size, minimum, maximum, centerSum);
+    AxisRange range{(centerSum - size) / 2, 0};
+    range.upper = range.lower + size;
+    return ShiftIntoBounds(range, lowerBound, upperBound);
+}
+
+AxisRange CalculateAxis(
+    long initialLower,
+    long initialUpper,
+    long delta,
+    bool draggingLower,
+    long minimum,
+    long maximum,
+    long screenLower,
+    long screenUpper) noexcept {
+    const long centerSum = initialLower + initialUpper;
+    minimum = std::max(1L, minimum);
+    maximum = std::max(minimum, maximum);
+
+    // A window that was already partly off-screen must not jump when the
+    // gesture begins, but it is never allowed to move farther off-screen.
+    const long lowerBound = std::min(initialLower, screenLower);
+    const long upperBound = std::max(initialUpper, screenUpper);
+    const long available = std::max(1L, upperBound - lowerBound);
+    maximum = std::min(maximum, available);
+    minimum = std::min(minimum, maximum);
+
+    const std::int64_t rawLower64 = static_cast<std::int64_t>(initialLower) +
+        (draggingLower ? delta : -static_cast<std::int64_t>(delta));
+    const std::int64_t rawUpper64 = static_cast<std::int64_t>(initialUpper) +
+        (draggingLower ? -static_cast<std::int64_t>(delta) : delta);
+
+    // When shrinking crosses or reaches the minimum size, retaining the
+    // original center gives stable behaviour and prevents edge inversion.
+    const std::int64_t rawSize64 = rawUpper64 - rawLower64;
+    if (rawSize64 <= minimum) {
+        return CenteredRange(centerSum, minimum, minimum, maximum, lowerBound, upperBound);
+    }
+
+    const long rawLower = static_cast<long>(std::clamp<std::int64_t>(
+        rawLower64, std::numeric_limits<long>::min(), std::numeric_limits<long>::max()));
+    const long rawUpper = static_cast<long>(std::clamp<std::int64_t>(
+        rawUpper64, std::numeric_limits<long>::min(), std::numeric_limits<long>::max()));
+    AxisRange candidate{
+        std::max(rawLower, lowerBound),
+        std::min(rawUpper, upperBound)};
+    if (candidate.upper <= candidate.lower) {
+        return CenteredRange(centerSum, minimum, minimum, maximum, lowerBound, upperBound);
+    }
+
+    const long candidateSize = candidate.upper - candidate.lower;
+    if (candidateSize < minimum) {
+        return CenteredRange(centerSum, minimum, minimum, maximum, lowerBound, upperBound);
+    }
+    if (candidateSize <= maximum) {
+        return candidate;
+    }
+
+    // Apply the target window's maximum tracking size to the actual visible
+    // rectangle. If one screen edge was reached first, keep it pinned and let
+    // the other edge continue until the final size reaches this maximum.
+    const bool lowerPinned = rawLower < lowerBound;
+    const bool upperPinned = rawUpper > upperBound;
+    if (lowerPinned || upperPinned) {
+        bool anchorLower = lowerPinned && !upperPinned;
+        if (lowerPinned && upperPinned) {
+            const long lowerDistance = std::max(0L, initialLower - lowerBound);
+            const long upperDistance = std::max(0L, upperBound - initialUpper);
+            anchorLower = lowerDistance <= upperDistance;
+        }
+        AxisRange limited = anchorLower
+            ? AxisRange{lowerBound, lowerBound + maximum}
+            : AxisRange{upperBound - maximum, upperBound};
+        return ShiftIntoBounds(limited, lowerBound, upperBound);
+    }
+    return CenteredRange(centerSum, maximum, minimum, maximum, lowerBound, upperBound);
 }
 
 }  // namespace
@@ -68,51 +166,30 @@ RECT CalculateSymmetricRect(
     RECT result = initialRect;
     const long initialWidth = std::max(1L, initialRect.right - initialRect.left);
     const long initialHeight = std::max(1L, initialRect.bottom - initialRect.top);
-    const long centerXSum = initialRect.left + initialRect.right;
-    const long centerYSum = initialRect.top + initialRect.bottom;
-
     if (AffectsHorizontal(edge)) {
         const long delta = currentCursor.x - initialCursor.x;
-        long desiredWidth = initialWidth;
-        if (edge == ResizeEdge::Left || edge == ResizeEdge::TopLeft || edge == ResizeEdge::BottomLeft) {
-            desiredWidth -= 2 * delta;
-        } else {
-            desiredWidth += 2 * delta;
-        }
-
-        const long fitLeft = SafeTwiceDistance(centerXSum, constraints.screenBounds.left, true);
-        const long fitRight = SafeTwiceDistance(centerXSum, constraints.screenBounds.right, false);
-        // Do not make a pre-existing off-screen window jump. Its initial size
-        // becomes the ceiling until it is moved back on screen.
-        const long screenMaximum = std::max(initialWidth, std::min(fitLeft, fitRight));
-        const long maximum = std::min(
+        const bool draggingLeft = edge == ResizeEdge::Left ||
+            edge == ResizeEdge::TopLeft || edge == ResizeEdge::BottomLeft;
+        const AxisRange horizontal = CalculateAxis(
+            initialRect.left, initialRect.right, delta, draggingLeft,
+            constraints.minimum.cx,
             std::max(initialWidth, constraints.maximum.cx),
-            screenMaximum);
-        const long minimum = std::min(std::max(1L, constraints.minimum.cx), maximum);
-        const long width = ClampDimension(desiredWidth, minimum, maximum, centerXSum);
-        result.left = (centerXSum - width) / 2;
-        result.right = result.left + width;
+            constraints.screenBounds.left, constraints.screenBounds.right);
+        result.left = horizontal.lower;
+        result.right = horizontal.upper;
     }
 
     if (AffectsVertical(edge)) {
         const long delta = currentCursor.y - initialCursor.y;
-        long desiredHeight = initialHeight;
-        if (edge == ResizeEdge::Top || edge == ResizeEdge::TopLeft || edge == ResizeEdge::TopRight) {
-            desiredHeight -= 2 * delta;
-        } else {
-            desiredHeight += 2 * delta;
-        }
-
-        const long fitTop = SafeTwiceDistance(centerYSum, constraints.screenBounds.top, true);
-        const long fitBottom = SafeTwiceDistance(centerYSum, constraints.screenBounds.bottom, false);
-        const long screenMaximum = std::max(initialHeight, std::min(fitTop, fitBottom));
-        const long maximum = std::min(
+        const bool draggingTop = edge == ResizeEdge::Top ||
+            edge == ResizeEdge::TopLeft || edge == ResizeEdge::TopRight;
+        const AxisRange vertical = CalculateAxis(
+            initialRect.top, initialRect.bottom, delta, draggingTop,
+            constraints.minimum.cy,
             std::max(initialHeight, constraints.maximum.cy),
-            screenMaximum);
-        const long minimum = std::min(std::max(1L, constraints.minimum.cy), maximum);
-        const long height = ClampDimension(desiredHeight, minimum, maximum, centerYSum);
-        result.top = (centerYSum - height) / 2;
-        result.bottom = result.top + height;
+            constraints.screenBounds.top, constraints.screenBounds.bottom);
+        result.top = vertical.lower;
+        result.bottom = vertical.upper;
     }
 
     return result;
